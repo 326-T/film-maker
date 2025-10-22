@@ -37,39 +37,47 @@ class FilmStripSettings:
     fps: int = 30
     lead_in: float = 0.75
     lead_out: float = 0.75
-    frame_margin: int = 60
-    row_spacing: int = 80
+    frame_margin: int = 0
+    row_spacing: int = 0
     stripe_height: int = 70
     stripe_light_color: Tuple[int, int, int] = (235, 235, 235)
     stripe_dark_color: Tuple[int, int, int] = (26, 26, 26)
-    stripe_width: int = 8
-    stripe_gap: int = 10
+    perforation_size: int = 40
     background_color: Tuple[int, int, int] = (12, 12, 16)
 
 
 SETTINGS = FilmStripSettings()
 
 
-def create_stripe_pattern(
+def create_perforation_band(
     width: int,
     height: int,
     *,
-    light_color: Tuple[int, int, int],
-    dark_color: Tuple[int, int, int],
-    stripe_width: int,
-    stripe_gap: int,
+    band_color: Tuple[int, int, int],
+    perforation_color: Tuple[int, int, int],
+    square_size: int,
 ) -> np.ndarray:
-    """Return a vertical stripe pattern sized for the given width/height."""
+    """Return a band with repeating perforation squares along its width."""
 
-    pattern = np.empty((height, width, 3), dtype=np.uint8)
+    if square_size <= 0:
+        msg = "square_size must be positive"
+        raise ValueError(msg)
+
+    band = np.empty((height, width, 3), dtype=np.uint8)
     for channel in range(3):
-        pattern[:, :, channel] = dark_color[channel]
+        band[:, :, channel] = band_color[channel]
 
-    for x in range(0, width, stripe_width + stripe_gap):
-        x_end = min(x + stripe_width, width)
-        pattern[:, x:x_end, :] = light_color
+    usable_size = min(square_size, height)
+    vertical_offset = (height - usable_size) // 2
 
-    return pattern
+    step = max(square_size * 2, 1)
+    for x in range(0, width, step):
+        x_end = min(x + square_size, width)
+        band[vertical_offset : vertical_offset + usable_size, x:x_end, :] = (
+            perforation_color
+        )
+
+    return band
 
 
 def natural_key(path: Path) -> Tuple[Tuple[object, ...], str]:
@@ -136,8 +144,7 @@ def create_film_strip_video(
     stripe_height: int,
     stripe_light_color: Tuple[int, int, int],
     stripe_dark_color: Tuple[int, int, int],
-    stripe_width: int,
-    stripe_gap: int,
+    perforation_size: int,
     background_color: Tuple[int, int, int],
 ) -> Path:
     """Generate a dual-row film-strip video with stylised borders.
@@ -165,6 +172,9 @@ def create_film_strip_video(
         raise ValueError(msg)
     if stripe_height <= 0:
         msg = "stripe_height must be positive"
+        raise ValueError(msg)
+    if perforation_size <= 0:
+        msg = "perforation_size must be positive"
         raise ValueError(msg)
 
     usable_paths = sorted(
@@ -194,15 +204,13 @@ def create_film_strip_video(
     row_block_height = row_height + (stripe_height * 2)
     frame_height = frame_margin * 2 + row_block_height * 2 + row_spacing
 
-    stripe_pattern = create_stripe_pattern(
-        viewport_width,
+    perforation_strip = create_perforation_band(
+        strip_width,
         stripe_height,
-        light_color=stripe_light_color,
-        dark_color=stripe_dark_color,
-        stripe_width=stripe_width,
-        stripe_gap=stripe_gap,
+        band_color=stripe_dark_color,
+        perforation_color=stripe_light_color,
+        square_size=perforation_size,
     )
-    stripe_pattern_reverse = stripe_pattern[:, ::-1, :]
 
     background = np.full(
         (frame_height, viewport_width, 3),
@@ -240,23 +248,28 @@ def create_film_strip_video(
         offset = compute_offset(t, reverse=True)
         return strip_frame[:, offset : offset + viewport_width, :].copy()
 
+    def band_frame(t: float, *, reverse: bool) -> np.ndarray:
+        offset = compute_offset(t, reverse=reverse)
+        return perforation_strip[:, offset : offset + viewport_width, :].copy()
+
     def make_frame(t: float) -> np.ndarray:
         frame = background.copy()
 
         top_strip = top_row_frame(t)
         bottom_strip = bottom_row_frame(t)
 
-        frame[top_row_top : top_row_top + stripe_height, :, :] = stripe_pattern
+        top_band = band_frame(t, reverse=False)
+        bottom_band = band_frame(t, reverse=True)
+
+        frame[top_row_top : top_row_top + stripe_height, :, :] = top_band
         frame[top_image_top : top_image_top + row_height, :, :] = top_strip
         frame[
             top_image_top + row_height : top_image_top + row_height + stripe_height,
             :,
             :,
-        ] = stripe_pattern
+        ] = top_band
 
-        frame[bottom_row_top : bottom_row_top + stripe_height, :, :] = (
-            stripe_pattern_reverse
-        )
+        frame[bottom_row_top : bottom_row_top + stripe_height, :, :] = bottom_band
         frame[bottom_image_top : bottom_image_top + row_height, :, :] = bottom_strip
         frame[
             bottom_image_top + row_height : bottom_image_top
@@ -264,7 +277,7 @@ def create_film_strip_video(
             + stripe_height,
             :,
             :,
-        ] = stripe_pattern_reverse
+        ] = bottom_band
 
         return frame
 
@@ -298,8 +311,7 @@ def main() -> None:
         stripe_height=SETTINGS.stripe_height,
         stripe_light_color=SETTINGS.stripe_light_color,
         stripe_dark_color=SETTINGS.stripe_dark_color,
-        stripe_width=SETTINGS.stripe_width,
-        stripe_gap=SETTINGS.stripe_gap,
+        perforation_size=SETTINGS.perforation_size,
         background_color=SETTINGS.background_color,
     )
 
