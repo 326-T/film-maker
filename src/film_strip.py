@@ -31,15 +31,45 @@ class FilmStripSettings:
 
     input_dir: Path = Path("input")
     output_path: Path = Path("output/film_strip.mp4")
-    target_height: int = 720
+    target_height: int = 360
     viewport_width: int = 1920
-    scroll_speed: float = 240.0
+    scroll_speed: float = 260.0
     fps: int = 30
     lead_in: float = 0.75
     lead_out: float = 0.75
+    frame_margin: int = 60
+    row_spacing: int = 80
+    stripe_height: int = 70
+    stripe_light_color: Tuple[int, int, int] = (235, 235, 235)
+    stripe_dark_color: Tuple[int, int, int] = (26, 26, 26)
+    stripe_width: int = 8
+    stripe_gap: int = 10
+    background_color: Tuple[int, int, int] = (12, 12, 16)
 
 
 SETTINGS = FilmStripSettings()
+
+
+def create_stripe_pattern(
+    width: int,
+    height: int,
+    *,
+    light_color: Tuple[int, int, int],
+    dark_color: Tuple[int, int, int],
+    stripe_width: int,
+    stripe_gap: int,
+) -> np.ndarray:
+    """Return a vertical stripe pattern sized for the given width/height."""
+
+    pattern = np.empty((height, width, 3), dtype=np.uint8)
+    for channel in range(3):
+        pattern[:, :, channel] = dark_color[channel]
+
+    for x in range(0, width, stripe_width + stripe_gap):
+        x_end = min(x + stripe_width, width)
+        pattern[:, x:x_end, :] = light_color
+
+    return pattern
 
 
 def natural_key(path: Path) -> Tuple[Tuple[object, ...], str]:
@@ -66,7 +96,7 @@ def load_resized_frames(
     total_width = 0
 
     for path in image_paths:
-        clip = ImageClip(str(path)).resize(height=target_height)
+        clip = ImageClip(str(path)).resized(height=target_height)
         frame = clip.get_frame(0)
         clip.close()
 
@@ -101,21 +131,21 @@ def create_film_strip_video(
     fps: int,
     lead_in: float,
     lead_out: float,
+    frame_margin: int,
+    row_spacing: int,
+    stripe_height: int,
+    stripe_light_color: Tuple[int, int, int],
+    stripe_dark_color: Tuple[int, int, int],
+    stripe_width: int,
+    stripe_gap: int,
+    background_color: Tuple[int, int, int],
 ) -> Path:
-    """Generate a horizontally scrolling film-strip style video.
+    """Generate a dual-row film-strip video with stylised borders.
 
-    Args:
-        input_dir: Directory containing source images.
-        output_path: Output path for the generated video file.
-        target_height: Height (in pixels) to scale each source image.
-        viewport_width: Width of the cropped window that moves across the
-            stitched strip. ``None`` defaults to the strip width (no scroll).
-        scroll_speed: Pixels-per-second that the strip moves under the viewport.
-        fps: Frames per second for the exported video.
-        lead_in: Seconds to hold on the first frame before scrolling starts.
-        lead_out: Seconds to hold on the final frame after scrolling completes.
-    Returns:
-        The output path once the video has been written.
+    The input images are stitched into a single strip that is shown twice: the
+    upper row scrolls left-to-right, while the lower row scrolls right-to-left.
+    Each row is framed by a perforated stripe pattern to evoke the look of
+    analogue film.
     """
 
     if target_height <= 0:
@@ -129,6 +159,12 @@ def create_film_strip_video(
         raise ValueError(msg)
     if lead_in < 0 or lead_out < 0:
         msg = "lead_in and lead_out must be non-negative"
+        raise ValueError(msg)
+    if frame_margin < 0 or row_spacing < 0:
+        msg = "Layout spacing must be non-negative"
+        raise ValueError(msg)
+    if stripe_height <= 0:
+        msg = "stripe_height must be positive"
         raise ValueError(msg)
 
     usable_paths = sorted(
@@ -154,21 +190,83 @@ def create_film_strip_video(
     scroll_duration = scroll_distance / scroll_speed if scroll_distance else 0.0
     total_duration = lead_in + scroll_duration + lead_out
 
-    strip_height = strip_frame.shape[0]
+    row_height = strip_frame.shape[0]
+    row_block_height = row_height + (stripe_height * 2)
+    frame_height = frame_margin * 2 + row_block_height * 2 + row_spacing
 
-    def make_frame(t: float) -> np.ndarray:
+    stripe_pattern = create_stripe_pattern(
+        viewport_width,
+        stripe_height,
+        light_color=stripe_light_color,
+        dark_color=stripe_dark_color,
+        stripe_width=stripe_width,
+        stripe_gap=stripe_gap,
+    )
+    stripe_pattern_reverse = stripe_pattern[:, ::-1, :]
+
+    background = np.full(
+        (frame_height, viewport_width, 3),
+        fill_value=background_color,
+        dtype=np.uint8,
+    )
+
+    top_row_top = frame_margin
+    bottom_row_top = frame_margin + row_block_height + row_spacing
+    top_image_top = top_row_top + stripe_height
+    bottom_image_top = bottom_row_top + stripe_height
+
+    def compute_offset(t: float, *, reverse: bool) -> int:
         if scroll_distance == 0:
-            return strip_frame[:, :viewport_width]
+            return 0
 
         if t <= lead_in:
-            offset = 0
+            progress = 0.0
         elif t >= lead_in + scroll_duration:
-            offset = scroll_distance
+            progress = float(scroll_distance)
         else:
-            offset = int(round((t - lead_in) * scroll_speed))
-            offset = min(offset, scroll_distance)
+            progress = (t - lead_in) * scroll_speed
 
-        return strip_frame[:, offset : offset + viewport_width]
+        progress = max(0.0, min(progress, float(scroll_distance)))
+
+        offset = float(scroll_distance) - progress if reverse else progress
+        offset_int = int(round(offset))
+        return max(0, min(offset_int, scroll_distance))
+
+    def top_row_frame(t: float) -> np.ndarray:
+        offset = compute_offset(t, reverse=False)
+        return strip_frame[:, offset : offset + viewport_width, :].copy()
+
+    def bottom_row_frame(t: float) -> np.ndarray:
+        offset = compute_offset(t, reverse=True)
+        return strip_frame[:, offset : offset + viewport_width, :].copy()
+
+    def make_frame(t: float) -> np.ndarray:
+        frame = background.copy()
+
+        top_strip = top_row_frame(t)
+        bottom_strip = bottom_row_frame(t)
+
+        frame[top_row_top : top_row_top + stripe_height, :, :] = stripe_pattern
+        frame[top_image_top : top_image_top + row_height, :, :] = top_strip
+        frame[
+            top_image_top + row_height : top_image_top + row_height + stripe_height,
+            :,
+            :,
+        ] = stripe_pattern
+
+        frame[bottom_row_top : bottom_row_top + stripe_height, :, :] = (
+            stripe_pattern_reverse
+        )
+        frame[bottom_image_top : bottom_image_top + row_height, :, :] = bottom_strip
+        frame[
+            bottom_image_top + row_height : bottom_image_top
+            + row_height
+            + stripe_height,
+            :,
+            :,
+        ] = stripe_pattern_reverse
+
+        return frame
 
     video_clip = VideoClip(make_frame, duration=total_duration)
 
@@ -195,6 +293,14 @@ def main() -> None:
         fps=SETTINGS.fps,
         lead_in=SETTINGS.lead_in,
         lead_out=SETTINGS.lead_out,
+        frame_margin=SETTINGS.frame_margin,
+        row_spacing=SETTINGS.row_spacing,
+        stripe_height=SETTINGS.stripe_height,
+        stripe_light_color=SETTINGS.stripe_light_color,
+        stripe_dark_color=SETTINGS.stripe_dark_color,
+        stripe_width=SETTINGS.stripe_width,
+        stripe_gap=SETTINGS.stripe_gap,
+        background_color=SETTINGS.background_color,
     )
 
 
